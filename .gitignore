@@ -1,0 +1,10 @@
+.venv/
+config.yaml
+courses.yaml
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/

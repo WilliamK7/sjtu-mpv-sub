@@ -1,0 +1,50 @@
+server:
+  host: "127.0.0.1"
+  port: 18732
+  idle_exit_seconds: 300
+
+tools:
+  mpv_path: "D:\\Program Files\\mpv-lazy\\mpv.exe"
+  ffmpeg_path: "ffmpeg"
+  ffprobe_path: "ffprobe"
+
+dashscope:
+  # Also falls back to environment variable DASHSCOPE_API_KEY
+  api_key: ""
+  # Optional Bailian Workspace ID (e.g. "ws-xxxx"). When set, routes ASR & LLM to {workspace_id}.{region}.maas.aliyuncs.com
+  workspace_id: ""
+  region: "cn-beijing"
+  uploads_base_url: "https://dashscope.aliyuncs.com/api/v1"
+  # Leave empty to derive automatically from workspace_id or default DashScope endpoint
+  asr_api_base_url: ""
+  asr_model: "qwen-audio-3.1-asr-flash-filetrans"
+  asr_language_hints:
+    - "en"
+    - "zh"
+  asr_poll_interval_seconds: 1.5
+  asr_timeout_seconds: 300.0
+  # Leave empty to derive automatically from workspace_id or default compatible-mode endpoint
+  llm_base_url: ""
+  # Recommended options: "qwen3.8-flash" (fastest/cheapest), "qwen3.7-plus" (balanced), "deepseek-v4.1-flash"
+  llm_model: "qwen3.8-flash"
+  # Bailian Qwen 3.7/3.8 & DeepSeek V4 default to thinking enabled; keep false for fast subtitle batching
+  llm_enable_thinking: false
+  # Leave empty to reuse dashscope.api_key
+  llm_api_key: ""
+  llm_proxy: ""
+
+pipeline:
+  first_chunk_seconds: 180
+  chunk_seconds: 420
+  max_concurrency: 3
+  translation_batch_size: 28
+  stop_on_mpv_exit: true
+  referer: "https://v.sjtu.edu.cn/jy-application-resourcemanage-ui/"
+
+subtitle:
+  # "zh_top" (Chinese above English) or "en_top" (English above Chinese)
+  bilingual_order: "zh_top"
+  font_zh: "Microsoft YaHei UI"
+  font_en: "Segoe UI"
+  size_zh: 46
+  size_en: 34
