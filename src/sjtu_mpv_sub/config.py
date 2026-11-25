@@ -49,9 +49,18 @@ class DashScopeConfig(BaseModel):
 class PipelineConfig(BaseModel):
     first_chunk_seconds: int = 180
     chunk_seconds: int = 420
+    urgent_chunk_seconds: int = 100
     max_concurrency: int = 3
+    urgent_burst_concurrency: int = 1
     translation_batch_size: int = 28
     stop_on_mpv_exit: bool = True
+    auto_detect_start: bool = True
+    auto_start_lead_seconds: float = 10.0
+    auto_detect_max_scan_seconds: float = 2400.0
+    auto_detect_step_seconds: float = 120.0
+    auto_detect_silence_db: float = -38.0
+    seek_poll_interval_seconds: float = 0.5
+    seek_debounce_seconds: float = 0.6
     referer: str = "https://v.sjtu.edu.cn/jy-application-resourcemanage-ui/"
 
 

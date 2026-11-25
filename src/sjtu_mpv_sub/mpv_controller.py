@@ -115,6 +115,49 @@ class MpvIpcClient:
         resp = self.send_command(["show-text", text, duration_ms])
         return resp.get("error") == "success"
 
+    def get_property(self, name: str) -> Any:
+        """Read a single mpv property via JSON IPC, returning None if unavailable."""
+        resp = self.send_command(["get_property", name])
+        if resp.get("error") == "success":
+            return resp.get("data")
+        return None
+
+    def get_time_pos(self) -> float | None:
+        """Return current mpv playback timestamp in seconds, or None if unavailable."""
+        val = self.get_property("time-pos")
+        if val is None:
+            return None
+        try:
+            return max(0.0, float(val))
+        except (TypeError, ValueError):
+            return None
+
+    def seek_absolute(self, seconds: float) -> bool:
+        """Seek mpv immediately to an absolute timestamp in seconds."""
+        target = max(0.0, float(seconds))
+        resp = self.send_command(["seek", target, "absolute+exact"])
+        return resp.get("error") == "success"
+
+    def send_hud_state(self, payload: dict[str, Any]) -> bool:
+        """Push structured subtitle progress state to the bundled Lua HUD script."""
+        encoded = json.dumps(payload, ensure_ascii=False)
+        resp = self.send_command(["script-message-to", "sjtu_sub_hud", "update", encoded])
+        return resp.get("error") == "success"
+
+    def clear_hud(self) -> bool:
+        """Hide/clear the bundled Lua HUD overlay."""
+        resp = self.send_command(["script-message-to", "sjtu_sub_hud", "clear"])
+        return resp.get("error") == "success"
+
+    def consume_user_cancel_flag(self) -> bool:
+        """Return True if the user triggered background cancellation from inside mpv."""
+        return bool(self.get_property("user-data/sjtu-sub/cancel"))
+
+
+def get_hud_script_path() -> Path:
+    """Return the path to the bundled mpv Lua HUD script."""
+    return Path(__file__).resolve().parent / "mpv_scripts" / "sjtu_sub_hud.lua"
+
 
 def build_mpv_pipe_path(job_id: str) -> str:
     """Return a clean Windows named pipe path for a playback job."""
@@ -131,6 +174,7 @@ def launch_mpv(
     media_title: str,
     referer: str = "",
     audio_edl_path: Path | None = None,
+    script_path: Path | None = None,
     extra_args: list[str] | None = None,
 ) -> subprocess.Popen[bytes]:
     """Launch mpv with EDL timeline, UTF-8 ASS subtitles, and IPC server enabled."""
@@ -146,6 +190,8 @@ def launch_mpv(
         cmd.append(f"--http-header-fields=Referer: {referer.strip()}")
     if audio_edl_path is not None:
         cmd.append(f"--audio-file={audio_edl_path}")
+    if script_path is not None and script_path.is_file():
+        cmd.append(f"--script={script_path}")
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(str(video_edl_path))

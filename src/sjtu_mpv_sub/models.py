@@ -98,4 +98,7 @@ class JobStatus(BaseModel):
     chunks_total: int
     mpv_launched: bool
     cache_hit: bool
+    covered_seconds: float = 0.0
+    total_seconds: float = 0.0
+    lecture_start_sec: float | None = None
     error: str | None = None

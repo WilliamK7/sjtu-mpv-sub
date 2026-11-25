@@ -1,14 +1,17 @@
 // ==UserScript==
 // @name         SJTU 课堂实录 mpv 双语流式播放
 // @namespace    https://v.sjtu.edu.cn/
-// @version      0.2.0
+// @version      0.3.1
 // @description  一键将交大课堂实录同一堂课分节合并为连续进度条流式唤起本地 mpv，并叠加阿里云百炼实时双语字幕
 // @author       sjtu-mpv-sub
 // @match        https://v.sjtu.edu.cn/jy-application-resourcemanage-ui/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        unsafeWindow
+// @grant        window.close
 // @connect      127.0.0.1
 // @connect      localhost
 // ==/UserScript==
@@ -21,6 +24,7 @@
   const WAKE_URI = 'sjtu-mpv://wake';
   const API_PREFIX = '/jy-application-resourcemanage/';
   const GROUP_MAX_GAP_MS = 35 * 60 * 1000;
+  const LOCAL_VIEW_STORE_KEY = 'sjtu_mpv_course_views';
 
   const state = {
     headers: {},
@@ -31,6 +35,7 @@
     vodCache: new Map(),
     pptCache: new Map(),
     preferredView: 'ppt',
+    viewManuallySelected: false,
     glossaryText: '',
     extraPrompt: '',
     forceRetranscribe: false,
@@ -38,18 +43,136 @@
     showEpisodes: false,
     minimized: false,
     busy: false,
-    jobActive: false,
+    allowWebVideoPlay: false,
     apiKeyConfigured: true,
-    activeJobId: null,
     pollTimer: null,
     statusText: '就绪',
     statusType: 'info',
     progressPct: 0,
   };
 
+  function readCourseViewMap() {
+    try {
+      if (typeof GM_getValue === 'function') {
+        const stored = GM_getValue(LOCAL_VIEW_STORE_KEY, {});
+        if (stored && typeof stored === 'object') return stored;
+      }
+    } catch {
+      // Fallback below.
+    }
+    try {
+      const raw = window.localStorage.getItem(LOCAL_VIEW_STORE_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function loadLocalCourseView(teclId) {
+    if (!teclId) return null;
+    const map = readCourseViewMap();
+    const v = map[String(teclId)];
+    return v === 'ppt' || v === 'camera' ? v : null;
+  }
+
+  function saveLocalCourseView(teclId, view) {
+    if (!teclId || (view !== 'ppt' && view !== 'camera')) return;
+    const map = Object.assign({}, readCourseViewMap(), { [String(teclId)]: view });
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(LOCAL_VIEW_STORE_KEY, map);
+      }
+    } catch {
+      // Ignore GM storage failure.
+    }
+    try {
+      window.localStorage.setItem(LOCAL_VIEW_STORE_KEY, JSON.stringify(map));
+    } catch {
+      // Ignore localStorage failure.
+    }
+  }
+
+  function setCurrentTeclId(rawTeclId) {
+    const nextId = Number(rawTeclId || 0);
+    if (!nextId) return;
+    if (state.teclId !== nextId) {
+      state.teclId = nextId;
+      state.viewManuallySelected = false;
+      state.preferredView = loadLocalCourseView(nextId) || 'ppt';
+      scheduleUiSync();
+    }
+  }
+
   function isPlayCenter() {
     return (window.location.hash || '').includes('/play-center');
   }
+
+  function pauseAllWebMedia() {
+    state.allowWebVideoPlay = false;
+    try {
+      document.querySelectorAll('video, audio').forEach((el) => {
+        try {
+          el.autoplay = false;
+          el.removeAttribute('autoplay');
+          el.pause();
+        } catch {
+          // Ignore media element errors.
+        }
+      });
+    } catch {
+      // Ignore DOM not ready.
+    }
+  }
+
+  function guardWebAutoplay(ev) {
+    if (!isPlayCenter() || state.allowWebVideoPlay) return;
+    const target = ev && ev.target;
+    if (target && typeof target.pause === 'function') {
+      try {
+        target.autoplay = false;
+        target.removeAttribute('autoplay');
+        target.pause();
+      } catch {
+        // Ignore pause errors.
+      }
+    }
+  }
+
+  // Block web player auto-play on page load while preserving explicit clicks on the player.
+  const origMediaPlay = win.HTMLMediaElement && win.HTMLMediaElement.prototype && win.HTMLMediaElement.prototype.play;
+  if (origMediaPlay) {
+    win.HTMLMediaElement.prototype.play = function () {
+      if (isPlayCenter() && !state.allowWebVideoPlay) {
+        try {
+          this.autoplay = false;
+          this.pause();
+        } catch {
+          // Ignore pause errors.
+        }
+        return Promise.resolve();
+      }
+      return origMediaPlay.apply(this, arguments);
+    };
+  }
+  document.addEventListener('play', guardWebAutoplay, true);
+  document.addEventListener('playing', guardWebAutoplay, true);
+  document.addEventListener('pointerdown', (ev) => {
+    if (!isPlayCenter()) return;
+    const panel = document.getElementById('sjtu-mpv-panel');
+    const modal = document.getElementById('sjtu-mpv-glossary-modal');
+    if ((panel && panel.contains(ev.target)) || (modal && modal.contains(ev.target))) {
+      return;
+    }
+    const target = ev.target;
+    if (
+      target &&
+      typeof target.closest === 'function' &&
+      target.closest('video, .vjs-tech, .xgplayer, [class*="player"], [class*="video"], [class*="play-btn"], [class*="control"]')
+    ) {
+      state.allowWebVideoPlay = true;
+    }
+  }, true);
 
   function parseDateTimeMs(str) {
     if (!str) return NaN;
@@ -118,8 +241,8 @@
 
     if (urlStr.includes('/v1/subject_vod_list_new') && Array.isArray(data.records)) {
       const teclParam = parseQueryParam(urlStr, 'teclIds');
-      if (teclParam && !state.teclId) {
-        state.teclId = Number(teclParam);
+      if (teclParam) {
+        setCurrentTeclId(teclParam);
       }
       state.episodes = data.records.slice();
       if (!state.courseName && data.records.length > 0) {
@@ -132,9 +255,12 @@
 
     if (urlStr.includes('/v1/course_vod_urls_new') && data.id) {
       const cid = Number(data.id);
+      if (state.currentCourseId !== cid && !state.busy) {
+        pauseAllWebMedia();
+      }
       state.vodCache.set(cid, data);
       state.currentCourseId = cid;
-      if (data.teclId) state.teclId = Number(data.teclId);
+      if (data.teclId) setCurrentTeclId(data.teclId);
       if (data.subjName) state.courseName = data.subjName;
       ensureEpisodeListLoaded();
       recomputeSelection(true);
@@ -153,7 +279,7 @@
 
     const teclMatch = urlStr.match(/\/v1\/(?:teachingClass|tecl-ai-show-config)\/(\d+)/);
     if (teclMatch && !state.teclId) {
-      state.teclId = Number(teclMatch[1]);
+      setCurrentTeclId(teclMatch[1]);
       ensureEpisodeListLoaded();
     }
   }
@@ -384,7 +510,10 @@
       await localRequest('GET', '/health', undefined, 350);
       const pref = await localRequest('GET', `/api/courses/${state.teclId}`, undefined, 1000);
       if (pref.preferred_view === 'ppt' || pref.preferred_view === 'camera') {
-        state.preferredView = pref.preferred_view;
+        saveLocalCourseView(state.teclId, pref.preferred_view);
+        if (!state.viewManuallySelected) {
+          state.preferredView = pref.preferred_view;
+        }
       }
       if (Array.isArray(pref.glossary)) {
         state.glossaryText = pref.glossary.join('\n');
@@ -392,7 +521,7 @@
       state.extraPrompt = pref.extra_prompt || '';
       scheduleUiSync();
     } catch {
-      // Service is asleep right now; will sync automatically upon wake.
+      // Service is asleep right now; local cache keeps UI aligned until wake.
     }
   }
 
@@ -470,8 +599,8 @@
       return;
     }
 
+    pauseAllWebMedia();
     state.busy = true;
-    state.jobActive = false;
     if (state.pollTimer) {
       clearInterval(state.pollTimer);
       state.pollTimer = null;
@@ -487,6 +616,13 @@
       if (state.teclId) {
         try {
           const pref = await localRequest('GET', `/api/courses/${state.teclId}`, undefined, 1000);
+          if (pref.preferred_view === 'ppt' || pref.preferred_view === 'camera') {
+            saveLocalCourseView(state.teclId, pref.preferred_view);
+            if (!state.viewManuallySelected) {
+              state.preferredView = pref.preferred_view;
+              scheduleUiSync();
+            }
+          }
           if (Array.isArray(pref.glossary)) state.glossaryText = pref.glossary.join('\n');
           state.extraPrompt = pref.extra_prompt || '';
         } catch {
@@ -494,66 +630,46 @@
         }
       }
 
-      setStatus(`正在拉取 ${selected.length} 节视频直链与 PPT 切片...`, 'info', 18);
+      setStatus(`正在拉取 ${selected.length} 节视频直链与 PPT 切片...`, 'info', 25);
       const segments = [];
       for (const ep of selected) {
         segments.push(await fetchSegmentPayload(ep));
       }
 
+      const teclIdToUse = Number(state.teclId || segments[0].course_id);
+      if (state.viewManuallySelected) {
+        saveLocalCourseView(teclIdToUse, state.preferredView);
+      }
+
       const payload = {
-        tecl_id: Number(state.teclId || segments[0].course_id),
+        tecl_id: teclIdToUse,
         course_name: state.courseName || 'SJTU 课堂实录',
-        preferred_view: state.preferredView,
+        preferred_view: state.viewManuallySelected ? state.preferredView : null,
         force_retranscribe: state.forceRetranscribe,
         segments,
       };
 
       const res = await localRequest('POST', '/api/play', payload, 5000);
-      state.activeJobId = res.job_id;
-      state.jobActive = true;
-      setStatus('已提交本机处理，准备启动 mpv...', 'info', 25);
+      setStatus('正在唤醒本地 mpv...', 'info', 70);
       startJobPolling(res.job_id);
     } catch (err) {
       state.busy = false;
-      state.jobActive = false;
-      setStatus(err && err.message ? err.message : String(err), 'error', 0);
-    }
-  }
-
-  async function onStopClicked() {
-    if (!state.activeJobId) return;
-    try {
-      const job = await localRequest('POST', `/api/jobs/${state.activeJobId}/cancel`, undefined, 3000);
-      if (state.pollTimer) {
-        clearInterval(state.pollTimer);
-        state.pollTimer = null;
-      }
-      state.busy = false;
-      state.jobActive = false;
-      setStatus(job.message || '已手动停止后台转录', 'warn', 0);
-    } catch (err) {
       setStatus(err && err.message ? err.message : String(err), 'error', 0);
     }
   }
 
   function startJobPolling(jobId) {
     if (state.pollTimer) clearInterval(state.pollTimer);
+    let closing = false;
     const pollOnce = async () => {
+      if (closing) return;
       try {
         const job = await localRequest('GET', `/api/jobs/${jobId}`, undefined, 2500);
-        const total = Math.max(1, Number(job.chunks_total || 1));
-        const done = Number(job.chunks_done || 0);
-        let pct = 25;
-        if (job.state === 'probing') pct = 28;
-        else if (job.state === 'running') pct = 35;
-        else if (job.state === 'playing') pct = 40 + Math.round((done / total) * 55);
-        else if (job.state === 'completed') pct = 100;
 
         if (job.state === 'failed') {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
           state.busy = false;
-          state.jobActive = false;
           setStatus(job.error || job.message || '处理失败', 'error', 0);
           return;
         }
@@ -561,29 +677,37 @@
           clearInterval(state.pollTimer);
           state.pollTimer = null;
           state.busy = false;
-          state.jobActive = false;
           setStatus(job.message || '已停止后台转录', 'warn', 0);
           return;
         }
-        if (job.state === 'completed') {
+        if (job.mpv_launched || job.state === 'playing' || job.state === 'completed') {
+          closing = true;
           clearInterval(state.pollTimer);
           state.pollTimer = null;
-          state.busy = false;
-          state.jobActive = false;
-          setStatus(job.message || '已就绪', 'success', 100);
+          pauseAllWebMedia();
+          setStatus('mpv 已启动，正在关闭本页...', 'success', 100);
+          setTimeout(() => {
+            try {
+              window.close();
+            } catch {
+              // Ignore if blocked.
+            }
+            setTimeout(() => {
+              state.busy = false;
+              setStatus('mpv 已接管播放（请在 mpv 内查看进度），可关闭本页', 'success', 100);
+            }, 800);
+          }, 250);
           return;
         }
-        if (job.state === 'playing') {
-          state.busy = false; // Allow user to interact again while background finishes.
-          state.jobActive = true;
-        }
-        setStatus(job.message || job.state, 'info', pct);
+
+        const pct = job.state === 'probing' ? 50 : 75;
+        setStatus(job.message || '正在准备唤醒 mpv...', 'info', pct);
       } catch {
         // Ignore transient poll glitches.
       }
     };
     pollOnce();
-    state.pollTimer = setInterval(pollOnce, 1000);
+    state.pollTimer = setInterval(pollOnce, 400);
   }
 
   function setStatus(text, type, pct) {
@@ -604,7 +728,10 @@
       state.glossaryText = Array.isArray(pref.glossary) ? pref.glossary.join('\n') : '';
       state.extraPrompt = pref.extra_prompt || '';
       if (pref.preferred_view === 'ppt' || pref.preferred_view === 'camera') {
-        state.preferredView = pref.preferred_view;
+        saveLocalCourseView(state.teclId, pref.preferred_view);
+        if (!state.viewManuallySelected) {
+          state.preferredView = pref.preferred_view;
+        }
       }
     } catch (err) {
       setStatus(err.message || String(err), 'error', 0);
@@ -647,12 +774,16 @@
         .filter(Boolean);
       const extraPrompt = modal.querySelector('#sjtu-mpv-prompt-input').value.trim();
       try {
-        await localRequest('PUT', `/api/courses/${state.teclId}`, {
+        const updateBody = {
           name: state.courseName,
-          preferred_view: state.preferredView,
           glossary: glossaryLines,
           extra_prompt: extraPrompt,
-        });
+        };
+        if (state.viewManuallySelected) {
+          updateBody.preferred_view = state.preferredView;
+          saveLocalCourseView(state.teclId, state.preferredView);
+        }
+        await localRequest('PUT', `/api/courses/${state.teclId}`, updateBody);
         state.glossaryText = glossaryLines.join('\n');
         state.extraPrompt = extraPrompt;
         setStatus(`已保存 ${glossaryLines.length} 条课程术语`, 'success', 0);
@@ -757,16 +888,6 @@
         padding: 8px 10px;
         cursor: pointer;
       }
-      .sjtu-mpv-btn-stop {
-        background: rgba(220, 38, 38, 0.24);
-        color: #fecaca;
-        border: 1px solid rgba(248, 113, 113, 0.45);
-        border-radius: 8px;
-        padding: 8px 10px;
-        cursor: pointer;
-        white-space: nowrap;
-      }
-      .sjtu-mpv-btn-stop:hover { background: rgba(220, 38, 38, 0.38); }
       .sjtu-mpv-icon-btn {
         background: rgba(255, 255, 255, 0.12);
         color: #fff;
@@ -886,11 +1007,8 @@
         </div>
         <div class="sjtu-mpv-actions">
           <button type="button" class="sjtu-mpv-btn-primary" id="sjtu-mpv-play" ${state.busy ? 'disabled' : ''}>
-            ${state.busy ? '处理中...' : '▶ 用 mpv 双语播放'}
+            ${state.busy ? '正在启动 mpv...' : '▶ 用 mpv 双语播放'}
           </button>
-          ${state.jobActive && state.activeJobId ? `
-            <button type="button" class="sjtu-mpv-btn-stop" id="sjtu-mpv-stop" title="停止后台字幕转录">⏹ 停止</button>
-          ` : ''}
           <button type="button" class="sjtu-mpv-btn-secondary" id="sjtu-mpv-glossary">📝 术语表</button>
         </div>
         <div class="sjtu-mpv-meta-row">
@@ -932,6 +1050,8 @@
     panel.querySelectorAll('.sjtu-mpv-seg-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         state.preferredView = btn.dataset.view === 'camera' ? 'camera' : 'ppt';
+        state.viewManuallySelected = true;
+        saveLocalCourseView(state.teclId, state.preferredView);
         renderPanel();
       });
     });
@@ -939,27 +1059,35 @@
       state.forceRetranscribe = Boolean(ev.target.checked);
     });
     panel.querySelector('#sjtu-mpv-play').addEventListener('click', onPlayClicked);
-    panel.querySelector('#sjtu-mpv-stop')?.addEventListener('click', onStopClicked);
     panel.querySelector('#sjtu-mpv-glossary').addEventListener('click', openGlossaryModal);
+  }
+
+  function handleRouteChange() {
+    state.allowWebVideoPlay = false;
+    scheduleUiSync();
   }
 
   const origPushState = win.history.pushState.bind(win.history);
   win.history.pushState = function () {
     const res = origPushState.apply(this, arguments);
-    scheduleUiSync();
+    handleRouteChange();
     return res;
   };
   const origReplaceState = win.history.replaceState.bind(win.history);
   win.history.replaceState = function () {
     const res = origReplaceState.apply(this, arguments);
-    scheduleUiSync();
+    handleRouteChange();
     return res;
   };
-  window.addEventListener('hashchange', scheduleUiSync);
-  window.addEventListener('popstate', scheduleUiSync);
+  window.addEventListener('hashchange', handleRouteChange);
+  window.addEventListener('popstate', handleRouteChange);
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', scheduleUiSync);
+    document.addEventListener('DOMContentLoaded', () => {
+      pauseAllWebMedia();
+      scheduleUiSync();
+    });
   } else {
+    pauseAllWebMedia();
     scheduleUiSync();
   }
 })();

@@ -36,9 +36,18 @@ dashscope:
 pipeline:
   first_chunk_seconds: 180
   chunk_seconds: 420
+  urgent_chunk_seconds: 100
   max_concurrency: 3
+  urgent_burst_concurrency: 1
   translation_batch_size: 28
   stop_on_mpv_exit: true
+  auto_detect_start: true
+  auto_start_lead_seconds: 10.0
+  auto_detect_max_scan_seconds: 2400.0
+  auto_detect_step_seconds: 120.0
+  auto_detect_silence_db: -38.0
+  seek_poll_interval_seconds: 0.5
+  seek_debounce_seconds: 0.6
   referer: "https://v.sjtu.edu.cn/jy-application-resourcemanage-ui/"
 
 subtitle:

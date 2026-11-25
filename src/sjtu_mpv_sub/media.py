@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -14,6 +16,7 @@ from pydantic import BaseModel
 from sjtu_mpv_sub.models import PptSlice, SegmentInput, StreamSource, ViewMode
 
 logger = logging.getLogger(__name__)
+_MEAN_VOLUME_RE = re.compile(r"mean_volume:\s*(-?\d+(?:\.\d+)?|-?inf)\s*dB", re.IGNORECASE)
 
 
 class StreamProbe(BaseModel):
@@ -262,3 +265,210 @@ async def extract_audio_chunk_async(
         ffmpeg_path,
         timeout,
     )
+
+
+def probe_audio_rms_db(
+    audio_url: str,
+    start_sec: float,
+    probe_duration_sec: float = 2.0,
+    referer: str = "",
+    ffmpeg_path: str = "ffmpeg",
+    timeout: float = 15.0,
+) -> float | None:
+    """Measure speech-band mean volume (dB) over a short HTTP-range audio slice."""
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-nostats",
+        "-v",
+        "info",
+        *_http_header_args(audio_url, referer),
+        "-ss",
+        f"{max(0.0, start_sec):.3f}",
+        "-i",
+        audio_url,
+        "-t",
+        f"{max(0.5, probe_duration_sec):.3f}",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "8000",
+        "-af",
+        "highpass=f=200,lowpass=f=3400,volumedetect",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            **_no_window_kwargs(),
+        )
+    except Exception as exc:
+        logger.debug("ffmpeg volumedetect failed at %.1fs: %s", start_sec, exc)
+        return None
+
+    if proc.returncode != 0:
+        logger.debug("ffmpeg volumedetect exited %d at %.1fs: %s", proc.returncode, start_sec, proc.stderr.strip()[:200])
+        return None
+
+    match = _MEAN_VOLUME_RE.search(proc.stderr or "")
+    if not match:
+        return None
+    raw = match.group(1).lower()
+    if "inf" in raw:
+        return -91.0
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+async def probe_audio_rms_db_async(
+    audio_url: str,
+    start_sec: float,
+    probe_duration_sec: float = 2.0,
+    referer: str = "",
+    ffmpeg_path: str = "ffmpeg",
+    timeout: float = 15.0,
+) -> float | None:
+    """Async wrapper for probe_audio_rms_db."""
+    return await asyncio.to_thread(
+        probe_audio_rms_db,
+        audio_url,
+        start_sec,
+        probe_duration_sec,
+        referer,
+        ffmpeg_path,
+        timeout,
+    )
+
+
+def locate_global_time(
+    segments: list[ResolvedSegment],
+    global_sec: float,
+) -> tuple[ResolvedSegment, float] | None:
+    """Map a global timeline offset (seconds) to (segment, local_offset_sec)."""
+    if not segments or global_sec < 0:
+        return None
+    cursor = 0.0
+    for seg in segments:
+        dur = max(0.0, float(seg.duration_sec))
+        if global_sec < cursor + dur:
+            return seg, max(0.0, global_sec - cursor)
+        cursor += dur
+    return None
+
+
+async def detect_lecture_start_async(
+    segments: list[ResolvedSegment],
+    *,
+    referer: str = "",
+    ffmpeg_path: str = "ffmpeg",
+    max_scan_sec: float = 2400.0,
+    step_sec: float = 120.0,
+    silence_db: float = -38.0,
+    lead_sec: float = 10.0,
+    probe_fn: Callable[[str, float, float], Awaitable[float | None]] | None = None,
+) -> float:
+    """Detect when sustained speech begins, returning recommended start offset in seconds."""
+    total_dur = sum(max(0.0, float(s.duration_sec)) for s in segments)
+    if not segments or total_dur <= 30.0:
+        return 0.0
+
+    async def _default_probe(audio_url: str, local_sec: float, probe_dur: float) -> float | None:
+        return await probe_audio_rms_db_async(
+            audio_url,
+            local_sec,
+            probe_duration_sec=probe_dur,
+            referer=referer,
+            ffmpeg_path=ffmpeg_path,
+        )
+
+    active_probe = probe_fn or _default_probe
+
+    async def _probe_global(g_sec: float) -> float | None:
+        located = locate_global_time(segments, g_sec)
+        if located is None:
+            return None
+        seg, local_sec = located
+        rem = max(0.5, min(2.0, float(seg.duration_sec) - local_sec))
+        return await active_probe(seg.audio_url, local_sec, rem)
+
+    async def _is_sustained(t_sec: float) -> bool:
+        for offset in (15.0, 30.0):
+            check_t = t_sec + offset
+            if check_t >= total_dur - 2.5:
+                return True
+            val = await _probe_global(check_t)
+            if val is not None and val >= silence_db:
+                return True
+        return False
+
+    # Wave 0: check near the very start and ~45s in parallel.
+    t5_pos = min(5.0, max(0.0, total_dur - 3.0))
+    t45_pos = min(45.0, max(0.0, total_dur - 2.5))
+    t5_val, t45_val = await asyncio.gather(_probe_global(t5_pos), _probe_global(t45_pos))
+
+    if t5_val is not None and t5_val >= silence_db:
+        if total_dur < 60.0 or (t45_val is not None and t45_val >= silence_db):
+            return 0.0
+
+    lo: float | None = None
+    hi: float | None = None
+
+    if t45_val is not None and t45_val >= silence_db and await _is_sustained(t45_pos):
+        lo = t5_pos
+        hi = t45_pos
+    else:
+        step = max(30.0, float(step_sec))
+        scan_limit = min(total_dur - 3.0, float(max_scan_sec))
+        grid: list[float] = []
+        cursor = step
+        while cursor <= scan_limit:
+            grid.append(cursor)
+            cursor += step
+
+        sem = asyncio.Semaphore(6)
+
+        async def _scan_one(t_sec: float) -> tuple[float, float | None]:
+            async with sem:
+                return t_sec, await _probe_global(t_sec)
+
+        prev_silent = t45_pos
+        for wave in (grid[:8], grid[8:]):
+            if not wave:
+                continue
+            results = await asyncio.gather(*(_scan_one(t) for t in wave))
+            for t_sec, rms in results:
+                if rms is not None and rms >= silence_db:
+                    if await _is_sustained(t_sec):
+                        lo = prev_silent
+                        hi = t_sec
+                        break
+                else:
+                    prev_silent = t_sec
+            if hi is not None:
+                break
+
+    if hi is None or lo is None:
+        return 0.0
+
+    # Wave 2: 3-step binary refinement between last silent point and first confirmed speech.
+    for _ in range(3):
+        if hi - lo <= 12.0:
+            break
+        mid = (lo + hi) / 2.0
+        rms = await _probe_global(mid)
+        if rms is not None and rms >= silence_db:
+            hi = mid
+        else:
+            lo = mid
+
+    return max(0.0, round(hi - max(0.0, float(lead_sec)), 1))
