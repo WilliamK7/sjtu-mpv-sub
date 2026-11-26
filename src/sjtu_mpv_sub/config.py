@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from sjtu_mpv_sub.models import BilingualOrder, CoursePreference, CoursePreferenceUpdate
+from sjtu_mpv_sub.models import BilingualOrder, CoursePreference, CoursePreferenceUpdate, SubtitleStyle
 
 _COURSES_LOCK = threading.RLock()
 _DEFAULT_MPV_FALLBACK = Path(r"D:\Program Files\mpv-lazy\mpv.exe")
@@ -52,7 +52,8 @@ class PipelineConfig(BaseModel):
     urgent_chunk_seconds: int = 100
     max_concurrency: int = 3
     urgent_burst_concurrency: int = 1
-    translation_batch_size: int = 28
+    translation_batch_size: int = 12
+    enable_thumbnails: bool = True
     stop_on_mpv_exit: bool = True
     auto_detect_start: bool = True
     auto_start_lead_seconds: float = 10.0
@@ -65,6 +66,7 @@ class PipelineConfig(BaseModel):
 
 
 class SubtitleConfig(BaseModel):
+    style: SubtitleStyle = "box"
     bilingual_order: BilingualOrder = "zh_top"
     font_zh: str = "Microsoft YaHei UI"
     font_en: str = "Segoe UI"

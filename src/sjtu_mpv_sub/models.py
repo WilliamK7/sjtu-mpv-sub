@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 ViewMode = Literal["ppt", "camera"]
 JobState = Literal["queued", "probing", "running", "playing", "completed", "canceled", "failed"]
 BilingualOrder = Literal["zh_top", "en_top"]
+SubtitleStyle = Literal["box", "outline"]
 
 
 class StreamSource(BaseModel):

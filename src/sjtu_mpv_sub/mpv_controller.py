@@ -159,6 +159,11 @@ def get_hud_script_path() -> Path:
     return Path(__file__).resolve().parent / "mpv_scripts" / "sjtu_sub_hud.lua"
 
 
+def get_thumb_script_path() -> Path:
+    """Return the path to the bundled Referer-aware uosc thumbnailer script."""
+    return Path(__file__).resolve().parent / "mpv_scripts" / "sjtu_thumb.lua"
+
+
 def build_mpv_pipe_path(job_id: str) -> str:
     """Return a clean Windows named pipe path for a playback job."""
     safe = "".join(c for c in job_id if c.isalnum() or c in ("-", "_"))
@@ -175,6 +180,7 @@ def launch_mpv(
     referer: str = "",
     audio_edl_path: Path | None = None,
     script_path: Path | None = None,
+    thumb_script_path: Path | None = None,
     extra_args: list[str] | None = None,
 ) -> subprocess.Popen[bytes]:
     """Launch mpv with EDL timeline, UTF-8 ASS subtitles, and IPC server enabled."""
@@ -192,6 +198,13 @@ def launch_mpv(
         cmd.append(f"--audio-file={audio_edl_path}")
     if script_path is not None and script_path.is_file():
         cmd.append(f"--script={script_path}")
+    if thumb_script_path is not None and thumb_script_path.is_file():
+        cmd.append(f"--script={thumb_script_path}")
+        cmd.append("--script-opts-append=thumb_engine-load=no")
+        cmd.append("--script-opts-append=uosc-thumbnail_provider=sjtu_thumb")
+        cmd.append(f"--script-opts-append=sjtu_thumb-mpv_path={mpv_path}")
+        if referer.strip():
+            cmd.append(f"--script-opts-append=sjtu_thumb-referer={referer.strip()}")
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(str(video_edl_path))

@@ -35,6 +35,7 @@ from sjtu_mpv_sub.media import (
     resolve_segment_tracks_async,
 )
 from sjtu_mpv_sub.models import (
+    AsrSentence,
     BilingualCue,
     CoursePreferenceUpdate,
     JobStatus,
@@ -48,6 +49,7 @@ from sjtu_mpv_sub.mpv_controller import (
     build_edl,
     build_mpv_pipe_path,
     get_hud_script_path,
+    get_thumb_script_path,
     launch_mpv,
     write_edl,
 )
@@ -310,6 +312,7 @@ class LecturePipeline:
         mpv_exit_poll_interval: float = 0.5,
         start_detector: Callable[..., Awaitable[float]] | None = None,
         hud_script_path: Path | None = None,
+        thumb_script_path: Path | None = None,
     ) -> None:
         self.config = config
         self.root_dir = root_dir
@@ -321,6 +324,11 @@ class LecturePipeline:
         self._mpv_exit_poll_interval = max(0.02, float(mpv_exit_poll_interval))
         self._start_detector = start_detector or detect_lecture_start_async
         self._hud_script_path = hud_script_path if hud_script_path is not None else get_hud_script_path()
+        self._thumb_script_path = (
+            thumb_script_path
+            if thumb_script_path is not None
+            else (get_thumb_script_path() if config.pipeline.enable_thumbnails else None)
+        )
 
     @staticmethod
     def _default_asr_factory(cfg: AppConfig) -> ASRProvider:
@@ -373,6 +381,7 @@ class LecturePipeline:
         sub_path = cache_dir / "bilingual.ass"
         meta_path = cache_dir / "meta.json"
         cues_path = cache_dir / "cues.json"
+        asr_path = cache_dir / "asr.json"
 
         course_pref = get_course_preference(req.tecl_id, root_dir=self.root_dir)
         effective_view = req.preferred_view or course_pref.preferred_view
@@ -431,6 +440,7 @@ class LecturePipeline:
             # Load existing full or incremental cache unless force_retranscribe is requested.
             meta: dict[str, Any] = {}
             all_cues: list[BilingualCue] = []
+            all_asr: list[AsrSentence] = []
             covered_ranges: list[tuple[int, int]] = []
             saved_lecture_start_sec: float | None = None
 
@@ -450,6 +460,15 @@ class LecturePipeline:
                             all_cues.sort(key=lambda c: (c.start_ms, c.end_ms))
                     except Exception:
                         all_cues = []
+
+                if asr_path.is_file():
+                    try:
+                        raw_asr = json.loads(asr_path.read_text(encoding="utf-8"))
+                        if isinstance(raw_asr, list):
+                            all_asr = [AsrSentence.model_validate(item) for item in raw_asr]
+                            all_asr.sort(key=lambda s: (s.start_ms, s.end_ms))
+                    except Exception:
+                        all_asr = []
 
                 raw_start = meta.get("lecture_start_sec")
                 if raw_start is not None:
@@ -486,6 +505,7 @@ class LecturePipeline:
                     referer=self.config.pipeline.referer,
                     audio_edl_path=audio_edl_path if use_separate_audio else None,
                     script_path=self._hud_script_path,
+                    thumb_script_path=self._thumb_script_path,
                 )
                 if self._on_mpv_started:
                     self._on_mpv_started(proc)
@@ -534,6 +554,7 @@ class LecturePipeline:
                 referer=self.config.pipeline.referer,
                 audio_edl_path=audio_edl_path if use_separate_audio else None,
                 script_path=self._hud_script_path,
+                thumb_script_path=self._thumb_script_path,
             )
             if self._on_mpv_started:
                 self._on_mpv_started(mpv_proc)
@@ -604,6 +625,9 @@ class LecturePipeline:
                 all_cues.sort(key=lambda c: (c.start_ms, c.end_ms))
                 write_ass_atomic(sub_path, render_ass(all_cues, self.config.subtitle))
                 _write_json(cues_path, [c.model_dump(mode="json") for c in all_cues])
+                if all_asr:
+                    all_asr.sort(key=lambda s: (s.start_ms, s.end_ms))
+                    _write_json(asr_path, [s.model_dump(mode="json") for s in all_asr])
                 _write_json(
                     meta_path,
                     {
@@ -766,7 +790,7 @@ class LecturePipeline:
             translator = self._translator_factory(self.config)
             merge_lock = asyncio.Lock()
 
-            async def process_single_chunk(task: ChunkTask) -> list[BilingualCue]:
+            async def process_single_chunk(task: ChunkTask) -> tuple[list[AsrSentence], list[BilingualCue]]:
                 audio_path = temp_dir / f"chunk_{task.index:03d}.mp3"
                 try:
                     await extract_audio_chunk_async(
@@ -800,7 +824,15 @@ class LecturePipeline:
                         batch_size=self.config.pipeline.translation_batch_size,
                     )
                     base_offset_ms = task.period_offset_ms + int(round(task.start_sec * 1000.0))
-                    return [
+                    global_asr = [
+                        AsrSentence(
+                            start_ms=base_offset_ms + sent.start_ms,
+                            end_ms=base_offset_ms + sent.end_ms,
+                            text=sent.text,
+                        )
+                        for sent in sentences
+                    ]
+                    global_cues = [
                         BilingualCue(
                             start_ms=base_offset_ms + cue.start_ms,
                             end_ms=base_offset_ms + cue.end_ms,
@@ -809,6 +841,7 @@ class LecturePipeline:
                         )
                         for cue in translated
                     ]
+                    return global_asr, global_cues
                 finally:
                     audio_path.unlink(missing_ok=True)
 
@@ -897,14 +930,21 @@ class LecturePipeline:
                 return None
 
             async def _run_worker(task: ChunkTask, is_urgent: bool) -> None:
-                nonlocal covered_ranges, worker_error, all_cues
+                nonlocal covered_ranges, worker_error, all_cues, all_asr
                 try:
-                    chunk_cues = await process_single_chunk(task)
+                    chunk_asr, chunk_cues = await process_single_chunk(task)
                     if stop_on_exit and mpv_proc.poll() is not None:
                         return
                     async with merge_lock:
                         g_start = task.global_start_ms
                         g_end = task.global_end_ms
+                        if chunk_asr:
+                            all_asr = [
+                                s
+                                for s in all_asr
+                                if not (g_start <= ((s.start_ms + s.end_ms) // 2) < g_end)
+                            ]
+                            all_asr.extend(chunk_asr)
                         if chunk_cues:
                             all_cues = [
                                 c

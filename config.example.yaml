@@ -39,7 +39,8 @@ pipeline:
   urgent_chunk_seconds: 100
   max_concurrency: 3
   urgent_burst_concurrency: 1
-  translation_batch_size: 28
+  translation_batch_size: 12
+  enable_thumbnails: true
   stop_on_mpv_exit: true
   auto_detect_start: true
   auto_start_lead_seconds: 10.0
@@ -51,6 +52,8 @@ pipeline:
   referer: "https://v.sjtu.edu.cn/jy-application-resourcemanage-ui/"
 
 subtitle:
+  # "box" (BorderStyle=4 unified translucent card) or "outline" (BorderStyle=1 outline + drop shadow)
+  style: "box"
   # "zh_top" (Chinese above English) or "en_top" (English above Chinese)
   bilingual_order: "zh_top"
   font_zh: "Microsoft YaHei UI"
